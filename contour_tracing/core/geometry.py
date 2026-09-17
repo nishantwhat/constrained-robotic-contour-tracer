@@ -2,19 +2,39 @@ import numpy as np
 from typing import Tuple, Dict
 
 
-class ArchimedeanSpiral:
-    """Parametric Archimedean Spiral in 2D task frame: r(theta) = a + b * theta."""
+# class ArchimedeanSpiral:
+#     """Parametric Archimedean Spiral in 2D task frame: r(theta) = a + b * theta."""
 
-    def __init__(self, a: float = 0.02, b: float = 0.015, theta_max: float = 4.0 * np.pi):
+#     def __init__(self, a: float = 0.02, b: float = 0.015, theta_max: float = 4.0 * np.pi):
+#         self.a = a
+#         self.b = b
+#         self.theta_max = theta_max
+
+#     def evaluate(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+#         """Evaluates 2D Cartesian coordinates (x, y) given theta array."""
+#         r = self.a + self.b * theta
+#         x = r * np.cos(theta)
+#         y = r * np.sin(theta)
+#         return x, y
+class ArchimedeanSpiral:
+    """Parametric Archimedean Spiral shifted into active workspace."""
+
+    def __init__(
+        self,
+        a: float = 0.02,
+        b: float = 0.012,
+        theta_max: float = 3.0 * np.pi,
+        center: Tuple[float, float] = (0.25, 0.10),
+    ):
         self.a = a
         self.b = b
         self.theta_max = theta_max
+        self.xc, self.yc = center
 
     def evaluate(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Evaluates 2D Cartesian coordinates (x, y) given theta array."""
         r = self.a + self.b * theta
-        x = r * np.cos(theta)
-        y = r * np.sin(theta)
+        x = self.xc + r * np.cos(theta)
+        y = self.yc + r * np.sin(theta)
         return x, y
 
 
