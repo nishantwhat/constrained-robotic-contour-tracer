@@ -1,7 +1,10 @@
 import numpy as np
 from contour_tracing.core.geometry import ArchimedeanSpiral, sample_curve_arc_length, SCurveProfile
 from contour_tracing.core.control import run_closed_loop_simulation
-from contour_tracing.core.metrics import compute_performance_metrics
+from contour_tracing.core.metrics import (
+    compute_performance_metrics,
+    validate_performance_metrics,
+)
 from contour_tracing.visualization.dashboard import plot_tracing_dashboard
 
 
@@ -39,9 +42,42 @@ def run_phase5_evaluation():
     print(f"-> Normal Force Error RMSE : {metrics['rmse_force_n']:.2f} N")
     print("--------------------------------------\n")
 
-    # Assert System Level Specifications
-    assert metrics['max_pos_err_mm'] < 15.0, "Position accuracy test failed!"
-    assert abs(metrics['mean_force_n'] - 10.0) < 2.0, "Force regulation test failed!"
+    
+    # Validate against system-level specifications
+    validation = validate_performance_metrics(
+        metrics=metrics,
+        max_position_error_mm=15.0,
+        target_force=10.0,
+        force_tolerance_n=2.0,
+    )
+
+    print("\n--- SYSTEM VALIDATION ---")
+    print(
+        f"-> Position Tracking : "
+        f"{'PASS' if validation['position_pass'] else 'FAIL'}"
+    )
+    print(
+        f"-> Force Regulation  : "
+        f"{'PASS' if validation['force_pass'] else 'FAIL'}"
+    )
+    print(
+        f"-> Overall Status    : "
+        f"{'PASS' if validation['overall_pass'] else 'FAIL'}"
+    )
+    print("-------------------------\n")
+
+    assert validation["position_pass"], (
+        "Position accuracy specification failed!"
+    )
+
+    assert validation["force_pass"], (
+        "Force regulation specification failed!"
+    )
+
+    assert validation["overall_pass"], (
+        "Controller performance validation failed!"
+    )
+
     print("-> ALL PHASE 5 SYSTEM SPECIFICATIONS PASSED!")
 
     # 4. Render Dashboard
