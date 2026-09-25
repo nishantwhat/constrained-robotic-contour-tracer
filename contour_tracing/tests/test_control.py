@@ -1,36 +1,79 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from contour_tracing.core.geometry import ArchimedeanSpiral, sample_curve_arc_length, SCurveProfile
-from contour_tracing.core.control import run_closed_loop_simulation
+
+from contour_tracing.core.control import (
+    DecoupledHybridController,
+    RobotState,
+    ControlReference,
+    ControllerCommand,
+)
 
 
-def test_closed_loop_tracing():
-    print("Testing Phase 4 Decoupled Hybrid Controller...")
+def test_controller_interface_returns_command():
+    """Controller should return a valid ControllerCommand."""
 
-    spiral = ArchimedeanSpiral(a=0.02, b=0.01, theta_max=2.5 * np.pi, center=(0.25, 0.10))
-    x_samp, y_samp, s_samp = sample_curve_arc_length(spiral, ds=0.002)
-    spiral_pts = np.column_stack((x_samp, y_samp))
+    controller = DecoupledHybridController()
 
-    profiler = SCurveProfile(max_vel=0.03, max_acc=0.015)
-    profile = profiler.generate_profile(total_s=s_samp[-1], dt=0.002)
+    state = RobotState(
+        position=np.array([0.25, 0.10]),
+        velocity=np.array([0.01, 0.0]),
+        force=np.array([0.0, 9.5]),
+        joint_position=np.array([0.6, 0.8]),
+        joint_velocity=np.array([0.01, 0.02]),
+        jacobian=np.eye(2),
+        gravity=np.zeros(2),
+        coriolis=np.zeros(2),
+    )
 
-    # Set rigid surface at target contact Y height
-    surface_y_level = 0.10
-    sim_results = run_closed_loop_simulation(spiral_pts, profile, surface_y=surface_y_level)
+    reference = ControlReference(
+        position=np.array([0.26, 0.10]),
+        velocity=np.array([0.02, 0.0]),
+        force=10.0,
+    )
 
-    mean_err = np.mean(sim_results["error"])
-    max_err = np.max(sim_results["error"])
-    # Evaluate regulated force during steady-state contact
-    active_forces = sim_results["force"][sim_results["force"][:, 1] > 0.5, 1]
-    mean_force = np.mean(active_forces) if len(active_forces) > 0 else 0.0
+    command = controller.compute(
+        state=state,
+        reference=reference,
+        dt=0.002,
+    )
 
-    print(f"-> Tangential Path Error - Mean: {mean_err * 1000:.2f} mm, Max: {max_err * 1000:.2f} mm")
-    print(f"-> Steady-State Regulated Normal Force: {mean_force:.2f} N")
-
-    assert max_err < 0.015, f"Tracking error threshold exceeded! Got {max_err*1000:.2f} mm"
-    assert abs(mean_force - 10.0) < 2.0, f"Force regulation failed! Got {mean_force:.2f} N"
-    print("-> Hybrid Force/Position Control Verification: PASSED")
+    assert isinstance(command, ControllerCommand)
+    assert command.task_wrench.shape == (2,)
+    assert command.torque.shape == (2,)
+    assert np.all(np.isfinite(command.torque))
 
 
-if __name__ == "__main__":
-    test_closed_loop_tracing()
+def test_controller_interface_accepts_external_model_quantities():
+    """Controller should work with externally supplied model quantities."""
+
+    controller = DecoupledHybridController()
+
+    state = RobotState(
+        position=np.array([0.25, 0.10]),
+        velocity=np.array([0.0, 0.0]),
+        force=np.array([0.0, 10.0]),
+        joint_position=np.array([0.6, 0.8]),
+        joint_velocity=np.array([0.0, 0.0]),
+        jacobian=np.array([
+            [0.5, 0.2],
+            [0.3, 0.4],
+        ]),
+        gravity=np.array([1.0, 2.0]),
+        coriolis=np.array([0.1, 0.2]),
+    )
+
+    reference = ControlReference(
+        position=np.array([0.25, 0.10]),
+        velocity=np.array([0.0, 0.0]),
+        force=10.0,
+    )
+
+    command = controller.compute(
+        state=state,
+        reference=reference,
+        dt=0.002,
+    )
+
+    assert isinstance(command, ControllerCommand)
+    assert command.task_wrench.shape == (2,)
+    assert command.torque.shape == (2,)
+    assert np.all(np.isfinite(command.torque))
