@@ -37,7 +37,8 @@ class ControllerCommand:
 
     task_wrench: np.ndarray
     torque: np.ndarray
-    
+
+
 class DecoupledHybridController:
     """True Hybrid Force/Position Controller using orthogonal subspace projection.
 
@@ -60,67 +61,70 @@ class DecoupledHybridController:
         self.f_des = target_force
         self.f_integral = 0.0
 
-def compute(
-    self,
-    state: RobotState,
-    reference: ControlReference,
-    dt: float,
-) -> ControllerCommand:
-    """Compute control command from simulator-independent state."""
+    def compute(
+        self,
+        state: RobotState,
+        reference: ControlReference,
+        dt: float,
+    ) -> ControllerCommand:
+        """Compute control command from simulator-independent state."""
 
-    x_curr = state.position
-    v_curr = state.velocity
+        x_curr = state.position
+        v_curr = state.velocity
 
-    x_des = reference.position
-    v_des = reference.velocity
+        x_des = reference.position
+        v_des = reference.velocity
 
-    # 1. Pure Tangential Position Control (X-Axis)
-    e_x = x_des[0] - x_curr[0]
-    e_vx = v_des[0] - v_curr[0]
+        # 1. Pure Tangential Position Control (X-Axis)
+        e_x = x_des[0] - x_curr[0]
+        e_vx = v_des[0] - v_curr[0]
 
-    Fx = self.kp_pos * e_x + self.kd_pos * e_vx
+        Fx = self.kp_pos * e_x + self.kd_pos * e_vx
 
-    # 2. Pure Normal Force Control (Y-Axis)
-    # Position control is intentionally excluded from Y.
-    fn_meas = state.force[1]
-    fn_err = reference.force - fn_meas
+        # 2. Pure Normal Force Control (Y-Axis)
+        # Position control is intentionally excluded from Y.
+        fn_meas = state.force[1]
+        fn_err = reference.force - fn_meas
 
-    if fn_meas > 0.01:
-        self.f_integral = np.clip(
-            self.f_integral + fn_err * dt,
-            -15.0,
-            15.0,
+        if fn_meas > 0.01:
+            self.f_integral = np.clip(
+                self.f_integral + fn_err * dt,
+                -15.0,
+                15.0,
+            )
+        else:
+            # Pre-load integral slightly to feedforward surface entry smoothly
+            self.f_integral = 2.0
+
+        Fy = -(
+            self.kp_force * fn_err
+            + self.ki_force * self.f_integral
         )
-    else:
-        # Pre-load integral slightly to feedforward surface entry smoothly
-        self.f_integral = 2.0
 
-    Fy = -(
-        self.kp_force * fn_err
-        + self.ki_force * self.f_integral
-    )
+        # 3. Decoupled Task-Space Wrench
+        task_wrench = np.array([Fx, Fy])
 
-    # 3. Decoupled Task-Space Wrench
-    task_wrench = np.array([Fx, Fy])
+        # 4. Map task-space wrench to joint torque
+        # Dynamic compensation is supplied by the simulator/model layer.
+        torque = (
+            state.jacobian.T @ task_wrench
+            + state.gravity
+            + state.coriolis
+        )
 
-    # 4. Map task-space wrench to joint torque
-    # Dynamic compensation is supplied by the simulator/model layer.
-    torque = (
-        state.jacobian.T @ task_wrench
-        + state.gravity
-        + state.coriolis
-    )
+        return ControllerCommand(
+            task_wrench=task_wrench,
+            torque=torque,
+        )
 
-    return ControllerCommand(
-        task_wrench=task_wrench,
-        torque=torque,
-    )
 
 def run_closed_loop_simulation(
     spiral_points: np.ndarray,
     time_profile: dict,
     surface_y: float = 0.0,
 ) -> dict:
+    """Run the numerical closed-loop contour-tracing simulation."""
+
     kin = Planar2LinkKinematics()
     dyn = TwoLinkDynamics()
     controller = DecoupledHybridController()
@@ -133,6 +137,7 @@ def run_closed_loop_simulation(
         target_pos=spiral_points[0],
         q_init=np.array([0.6, 0.8]),
     )
+
     dq_curr = np.zeros(2)
 
     telemetry = SimulationTelemetry()
@@ -149,19 +154,26 @@ def run_closed_loop_simulation(
         x_des = spiral_points[idx]
         v_des = np.array([v_target, 0.0])
 
+        # Current robot state from the numerical simulator
         x_curr = kin.forward_kinematics(q_curr)
         J = kin.jacobian(q_curr)
         v_curr = J @ dq_curr
 
+        # Environmental/contact interaction
         f_ext = dyn.compute_contact_force(
             x_curr,
             v_curr,
             surface_y,
         )
 
+        # Model quantities supplied to the controller
         gravity = dyn.gravity_vector(q_curr)
-        coriolis = dyn.coriolis_vector(q_curr, dq_curr)
-        
+        coriolis = dyn.coriolis_vector(
+            q_curr,
+            dq_curr,
+        )
+
+        # Simulator-independent robot state
         state = RobotState(
             position=x_curr,
             velocity=v_curr,
@@ -172,21 +184,24 @@ def run_closed_loop_simulation(
             gravity=gravity,
             coriolis=coriolis,
         )
-        
+
+        # Desired task-space reference
         reference = ControlReference(
             position=x_des,
             velocity=v_des,
             force=controller.f_des,
         )
-        
+
+        # Controller computes simulator-independent command
         command = controller.compute(
             state=state,
             reference=reference,
             dt=dt,
         )
-        
+
         tau = command.torque
 
+        # Numerical robot dynamics
         ddq = dyn.forward_dynamics(
             q_curr,
             dq_curr,
@@ -198,11 +213,12 @@ def run_closed_loop_simulation(
         dq_curr += ddq * dt
         q_curr += dq_curr * dt
 
-        # Evaluate tangential error along tracked X motion
+        # Evaluate tangential tracking error
         tracking_error = abs(
             x_des[0] - x_curr[0]
         )
 
+        # Record structured simulation telemetry
         telemetry.record(
             time=t_array[i],
             desired_position=x_des,
