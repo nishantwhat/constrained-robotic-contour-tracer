@@ -1,9 +1,43 @@
 import numpy as np
+from dataclasses import dataclass
+
 from contour_tracing.core.kinematics import Planar2LinkKinematics
 from contour_tracing.core.dynamics import TwoLinkDynamics
 from contour_tracing.core.telemetry import SimulationTelemetry
 
 
+@dataclass
+class RobotState:
+    """Simulator-independent robot state supplied to the controller."""
+
+    position: np.ndarray
+    velocity: np.ndarray
+    force: np.ndarray
+
+    joint_position: np.ndarray
+    joint_velocity: np.ndarray
+
+    jacobian: np.ndarray
+    gravity: np.ndarray
+    coriolis: np.ndarray
+
+
+@dataclass
+class ControlReference:
+    """Desired task-space state for the controller."""
+
+    position: np.ndarray
+    velocity: np.ndarray
+    force: float
+
+
+@dataclass
+class ControllerCommand:
+    """Controller output passed to the robot/simulator."""
+
+    task_wrench: np.ndarray
+    torque: np.ndarray
+    
 class DecoupledHybridController:
     """True Hybrid Force/Position Controller using orthogonal subspace projection.
 
@@ -26,55 +60,61 @@ class DecoupledHybridController:
         self.f_des = target_force
         self.f_integral = 0.0
 
-    def compute_control_torque(
-        self,
-        q: np.ndarray,
-        dq: np.ndarray,
-        x_des: np.ndarray,
-        v_des: np.ndarray,
-        f_meas: np.ndarray,
-        kin: Planar2LinkKinematics,
-        dyn: TwoLinkDynamics,
-        dt: float,
-    ) -> np.ndarray:
-        x_curr = kin.forward_kinematics(q)
-        J = kin.jacobian(q)
-        v_curr = J @ dq
+def compute(
+    self,
+    state: RobotState,
+    reference: ControlReference,
+    dt: float,
+) -> ControllerCommand:
+    """Compute control command from simulator-independent state."""
 
-        # 1. Pure Tangential Position Control (X-Axis)
-        e_x = x_des[0] - x_curr[0]
-        e_vx = v_des[0] - v_curr[0]
-        Fx = self.kp_pos * e_x + self.kd_pos * e_vx
+    x_curr = state.position
+    v_curr = state.velocity
 
-        # 2. Pure Normal Force Control (Y-Axis)
-        # We do NOT apply position PD along Y to prevent axis competition
-        fn_meas = f_meas[1]
-        fn_err = self.f_des - fn_meas
+    x_des = reference.position
+    v_des = reference.velocity
 
-        if fn_meas > 0.01:
-            self.f_integral = np.clip(
-                self.f_integral + fn_err * dt,
-                -15.0,
-                15.0,
-            )
-        else:
-            # Pre-load integral slightly to feedforward surface entry smoothly
-            self.f_integral = 2.0
+    # 1. Pure Tangential Position Control (X-Axis)
+    e_x = x_des[0] - x_curr[0]
+    e_vx = v_des[0] - v_curr[0]
 
-        Fy = -(
-            self.kp_force * fn_err
-            + self.ki_force * self.f_integral
+    Fx = self.kp_pos * e_x + self.kd_pos * e_vx
+
+    # 2. Pure Normal Force Control (Y-Axis)
+    # Position control is intentionally excluded from Y.
+    fn_meas = state.force[1]
+    fn_err = reference.force - fn_meas
+
+    if fn_meas > 0.01:
+        self.f_integral = np.clip(
+            self.f_integral + fn_err * dt,
+            -15.0,
+            15.0,
         )
+    else:
+        # Pre-load integral slightly to feedforward surface entry smoothly
+        self.f_integral = 2.0
 
-        # 3. Decoupled Task-Space Wrench
-        F_task = np.array([Fx, Fy])
+    Fy = -(
+        self.kp_force * fn_err
+        + self.ki_force * self.f_integral
+    )
 
-        # 4. Model Inversion / Dynamic Compensation
-        G = dyn.gravity_vector(q)
-        C = dyn.coriolis_vector(q, dq)
+    # 3. Decoupled Task-Space Wrench
+    task_wrench = np.array([Fx, Fy])
 
-        return J.T @ F_task + G + C
+    # 4. Map task-space wrench to joint torque
+    # Dynamic compensation is supplied by the simulator/model layer.
+    torque = (
+        state.jacobian.T @ task_wrench
+        + state.gravity
+        + state.coriolis
+    )
 
+    return ControllerCommand(
+        task_wrench=task_wrench,
+        torque=torque,
+    )
 
 def run_closed_loop_simulation(
     spiral_points: np.ndarray,
@@ -119,16 +159,33 @@ def run_closed_loop_simulation(
             surface_y,
         )
 
-        tau = controller.compute_control_torque(
-            q_curr,
-            dq_curr,
-            x_des,
-            v_des,
-            f_ext,
-            kin,
-            dyn,
-            dt,
+        gravity = dyn.gravity_vector(q_curr)
+        coriolis = dyn.coriolis_vector(q_curr, dq_curr)
+        
+        state = RobotState(
+            position=x_curr,
+            velocity=v_curr,
+            force=f_ext,
+            joint_position=q_curr,
+            joint_velocity=dq_curr,
+            jacobian=J,
+            gravity=gravity,
+            coriolis=coriolis,
         )
+        
+        reference = ControlReference(
+            position=x_des,
+            velocity=v_des,
+            force=controller.f_des,
+        )
+        
+        command = controller.compute(
+            state=state,
+            reference=reference,
+            dt=dt,
+        )
+        
+        tau = command.torque
 
         ddq = dyn.forward_dynamics(
             q_curr,
