@@ -1,6 +1,42 @@
 import numpy as np
+from dataclasses import dataclass
+
 from contour_tracing.core.kinematics import Planar2LinkKinematics
 from contour_tracing.core.dynamics import TwoLinkDynamics
+from contour_tracing.core.telemetry import SimulationTelemetry
+
+
+@dataclass
+class RobotState:
+    """Simulator-independent robot state supplied to the controller."""
+
+    position: np.ndarray
+    velocity: np.ndarray
+    force: np.ndarray
+
+    joint_position: np.ndarray
+    joint_velocity: np.ndarray
+
+    jacobian: np.ndarray
+    gravity: np.ndarray
+    coriolis: np.ndarray
+
+
+@dataclass
+class ControlReference:
+    """Desired task-space state for the controller."""
+
+    position: np.ndarray
+    velocity: np.ndarray
+    force: float
+
+
+@dataclass
+class ControllerCommand:
+    """Controller output passed to the robot/simulator."""
+
+    task_wrench: np.ndarray
+    torque: np.ndarray
 
 
 class DecoupledHybridController:
@@ -25,52 +61,70 @@ class DecoupledHybridController:
         self.f_des = target_force
         self.f_integral = 0.0
 
-    def compute_control_torque(
+    def compute(
         self,
-        q: np.ndarray,
-        dq: np.ndarray,
-        x_des: np.ndarray,
-        v_des: np.ndarray,
-        f_meas: np.ndarray,
-        kin: Planar2LinkKinematics,
-        dyn: TwoLinkDynamics,
+        state: RobotState,
+        reference: ControlReference,
         dt: float,
-    ) -> np.ndarray:
-        x_curr = kin.forward_kinematics(q)
-        J = kin.jacobian(q)
-        v_curr = J @ dq
+    ) -> ControllerCommand:
+        """Compute control command from simulator-independent state."""
+
+        x_curr = state.position
+        v_curr = state.velocity
+
+        x_des = reference.position
+        v_des = reference.velocity
 
         # 1. Pure Tangential Position Control (X-Axis)
         e_x = x_des[0] - x_curr[0]
         e_vx = v_des[0] - v_curr[0]
+
         Fx = self.kp_pos * e_x + self.kd_pos * e_vx
 
         # 2. Pure Normal Force Control (Y-Axis)
-        # We do NOT apply position PD along Y to prevent axis competition
-        fn_meas = f_meas[1]
-        fn_err = self.f_des - fn_meas
+        # Position control is intentionally excluded from Y.
+        fn_meas = state.force[1]
+        fn_err = reference.force - fn_meas
 
         if fn_meas > 0.01:
-            self.f_integral = np.clip(self.f_integral + fn_err * dt, -15.0, 15.0)
+            self.f_integral = np.clip(
+                self.f_integral + fn_err * dt,
+                -15.0,
+                15.0,
+            )
         else:
             # Pre-load integral slightly to feedforward surface entry smoothly
             self.f_integral = 2.0
 
-        Fy = -(self.kp_force * fn_err + self.ki_force * self.f_integral)
+        Fy = -(
+            self.kp_force * fn_err
+            + self.ki_force * self.f_integral
+        )
 
         # 3. Decoupled Task-Space Wrench
-        F_task = np.array([Fx, Fy])
+        task_wrench = np.array([Fx, Fy])
 
-        # 4. Model Inversion / Dynamic Compensation
-        G = dyn.gravity_vector(q)
-        C = dyn.coriolis_vector(q, dq)
+        # 4. Map task-space wrench to joint torque
+        # Dynamic compensation is supplied by the simulator/model layer.
+        torque = (
+            state.jacobian.T @ task_wrench
+            + state.gravity
+            + state.coriolis
+        )
 
-        return J.T @ F_task + G + C
+        return ControllerCommand(
+            task_wrench=task_wrench,
+            torque=torque,
+        )
+
+
 def run_closed_loop_simulation(
     spiral_points: np.ndarray,
     time_profile: dict,
     surface_y: float = 0.0,
 ) -> dict:
+    """Run the numerical closed-loop contour-tracing simulation."""
+
     kin = Planar2LinkKinematics()
     dyn = TwoLinkDynamics()
     controller = DecoupledHybridController()
@@ -83,41 +137,112 @@ def run_closed_loop_simulation(
         target_pos=spiral_points[0],
         q_init=np.array([0.6, 0.8]),
     )
+
     dq_curr = np.zeros(2)
 
-    q_log, pos_log, force_log, err_log = [], [], [], []
+    telemetry = SimulationTelemetry()
 
     for i in range(num_steps):
         s_target = time_profile["s"][i]
         v_target = time_profile["v"][i]
 
-        idx = min(int(s_target / 0.002), len(spiral_points) - 1)
+        idx = min(
+            int(s_target / 0.002),
+            len(spiral_points) - 1,
+        )
+
         x_des = spiral_points[idx]
         v_des = np.array([v_target, 0.0])
 
+        # Current robot state from the numerical simulator
         x_curr = kin.forward_kinematics(q_curr)
         J = kin.jacobian(q_curr)
         v_curr = J @ dq_curr
-        f_ext = dyn.compute_contact_force(x_curr, v_curr, surface_y)
 
-        tau = controller.compute_control_torque(
-            q_curr, dq_curr, x_des, v_des, f_ext, kin, dyn, dt
+        # Environmental/contact interaction
+        f_ext = dyn.compute_contact_force(
+            x_curr,
+            v_curr,
+            surface_y,
         )
 
-        ddq = dyn.forward_dynamics(q_curr, dq_curr, tau, f_ext, J)
+        # Model quantities supplied to the controller
+        gravity = dyn.gravity_vector(q_curr)
+        coriolis = dyn.coriolis_vector(
+            q_curr,
+            dq_curr,
+        )
+
+        # Simulator-independent robot state
+        state = RobotState(
+            position=x_curr,
+            velocity=v_curr,
+            force=f_ext,
+            joint_position=q_curr,
+            joint_velocity=dq_curr,
+            jacobian=J,
+            gravity=gravity,
+            coriolis=coriolis,
+        )
+
+        # Desired task-space reference
+        reference = ControlReference(
+            position=x_des,
+            velocity=v_des,
+            force=controller.f_des,
+        )
+
+        # Controller computes simulator-independent command
+        command = controller.compute(
+            state=state,
+            reference=reference,
+            dt=dt,
+        )
+
+        tau = command.torque
+
+        # Numerical robot dynamics
+        ddq = dyn.forward_dynamics(
+            q_curr,
+            dq_curr,
+            tau,
+            f_ext,
+            J,
+        )
+
         dq_curr += ddq * dt
         q_curr += dq_curr * dt
 
-        q_log.append(q_curr.copy())
-        pos_log.append(x_curr.copy())
-        force_log.append(f_ext.copy())
-        # Evaluate tangential error along tracked X motion
-        err_log.append(abs(x_des[0] - x_curr[0]))
+        # Evaluate tangential tracking error
+        tracking_error = abs(
+            x_des[0] - x_curr[0]
+        )
+
+        # Record structured simulation telemetry
+        telemetry.record(
+            time=t_array[i],
+            desired_position=x_des,
+            actual_position=x_curr,
+            desired_force=controller.f_des,
+            actual_force=f_ext,
+            joint_position=q_curr,
+            joint_velocity=dq_curr,
+            control_torque=tau,
+            tracking_error=tracking_error,
+        )
+
+    # Convert collected telemetry to NumPy arrays once,
+    # after the simulation has completed.
+    telemetry_data = telemetry.to_dict()
 
     return {
-        "t": t_array,
-        "q": np.array(q_log),
-        "pos": np.array(pos_log),
-        "force": np.array(force_log),
-        "error": np.array(err_log),
+        # Backward-compatible simulation outputs
+        "t": telemetry_data["time"],
+        "q": telemetry_data["joint_position"],
+        "pos": telemetry_data["actual_position"],
+        "force": telemetry_data["actual_force"],
+        "error": telemetry_data["tracking_error"],
+
+        # Structured telemetry for analysis and simulator integration
+        "telemetry": telemetry_data,
     }

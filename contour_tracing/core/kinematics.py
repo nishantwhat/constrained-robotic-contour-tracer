@@ -5,7 +5,7 @@ from typing import Tuple
 class Planar2LinkKinematics:
     """Kinematic engine for a 2-DOF planar serial manipulator."""
 
-    def __init__(self, l1: float = 0.25, l2: float = 0.25):
+    def __init__(self, l1: float = 0.35, l2: float = 0.35):
         """
         Args:
             l1: Length of Link 1 in meters.
